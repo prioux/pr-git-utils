@@ -1,0 +1,444 @@
+#!/usr/bin/perl -w
+
+##############################################################################
+#
+#                                 git-pr_hist
+#
+# DESCRIPTION:
+# A wrapper around several GIT commands
+#
+##############################################################################
+
+##########################
+# Initialization section #
+##########################
+
+require 5.00;
+use Cwd;
+use strict;
+use IO::File;
+
+# Default umask
+umask 027;
+
+# Program's name and version number.
+my ($BASENAME) = ($0 =~ /([^\/]+)$/);
+my $VERSION    = "2.0";
+
+# Get login name.
+my $USER=getpwuid($<) || getlogin || die "Can't find USER from environment!\n";
+
+#########
+# Usage #
+#########
+
+sub Usage { # private
+    print <<USAGE;
+
+$BASENAME $VERSION
+
+Usage: $BASENAME [path] [initial commit]
+
+This will launch an interactive tool to explore the GIT repository.
+Within it, use the "h" command to get more help.
+
+Note that this program is poor at understanding branching; it considers
+the full list of commits as ordered by timestamps only. Most of the time
+that makes little difference, but be careful.
+
+This program depends on the external programs "git-pr_log", "git-pr_csdiff"
+and "git-pr_blame" to produce many of its reports.
+
+USAGE
+    exit 1;
+}
+
+##################################
+# Global variables and constants #
+##################################
+
+my $DEBUG=0;
+my $TARGET=".";
+my $INITREV=undef;
+my $VERBOSE="";
+
+# Commands for pretty output
+my $PAGER              = $ENV{'GIT_HIST_PAGER'}         || "less -MEqisRFX";
+
+my $GIT_LOG_CMD        = $ENV{'GIT_HIST_LOG_CMD'}        || "git-pr_log";
+my $GIT_LOG_CMD_OPTS   = $ENV{'GIT_HIST_LOG_CMD_OPTS'}   || "";
+my $GIT_INFO_CMD       = $ENV{'GIT_HIST_INFO_CMD'}       || "git log";
+my $GIT_INFO_CMD_OPTS  = $ENV{'GIT_HIST_INFO_CMD_OPTS'}  || "";
+my $GIT_BLAME_CMD      = $ENV{'GIT_HIST_BLAME_CMD'}      || "git-pr_blame";
+my $GIT_BLAME_CMD_OPTS = $ENV{'GIT_HIST_BLAME_CMD_OPTS'} || "";
+my $GIT_DIFF_CMD       = $ENV{'GIT_HIST_DIFF_CMD'}       || "git-pr_csdiff";
+my $GIT_DIFF_CMD_OPTS  = $ENV{'GIT_HIST_DIFF_CMD_OPTS'}  || "-C5 -b";
+
+# Colors; darn I should be using Term::ANSIColor
+my $RESET_COL   = "\e[0m";
+my $PROMPT_COL  = "\e[1;33m";
+my $COMMAND_COL = "\e[1;32m";
+my $ERROR_COL   = "\e[1;31m";
+my $REV_PREFIX_LEN = 6;
+
+# Caches
+my $FULL_LOG_CACHE = "/tmp/git_pr_hist_fl.$$.txt";
+
+##############################
+# Parse command-line options #
+##############################
+
+for (;@ARGV;) {
+    # Add in the regex [] ALL single-character command-line options
+    my ($opt,$arg) = ($ARGV[0] =~ /^-([\@N])(.*)$/);
+    last if ! defined $opt;
+    # Add in regex [] ONLY single-character options that
+    # REQUIRE an argument, except for the '@' debug switch.
+    if ($opt =~ /[N]/ && $arg eq "") {
+        if (@ARGV < 2) {
+            print "Argument required for option \"$opt\".\n";
+            exit 1;
+        }
+        shift;
+        $arg=$ARGV[0];
+    }
+    $DEBUG=($arg ? $arg : 1)                     if $opt eq '@';
+    $REV_PREFIX_LEN=$arg                         if $opt eq 'N';
+    shift;
+}
+
+#################################
+# Validate command-line options #
+#################################
+
+&Usage if @ARGV > 0 && $ARGV[0] =~ /^-/;
+
+if (@ARGV == 1) {
+  $TARGET=shift;
+} elsif (@ARGV == 2) {
+  $TARGET=shift;
+  $INITREV=shift;
+  #die "Error: initial commit argument must be a .\n" unless $INITREV =~ /^\d*[1-9]\d*$/;
+}
+
+&Usage if @ARGV > 0;
+
+################
+# Trap Signals #
+################
+
+sub SigCleanup { # private
+     die "\nExiting: received signal \"" . $_[0] . "\".\n";
+}
+$SIG{'INT'}  = \&SigCleanup;
+$SIG{'TERM'} = \&SigCleanup;
+$SIG{'HUP'}  = \&SigCleanup;
+$SIG{'QUIT'} = \&SigCleanup;
+$SIG{'PIPE'} = \&SigCleanup;
+$SIG{'ALRM'} = \&SigCleanup;
+
+###############################
+#   M A I N   P R O G R A M   #
+###############################
+
+print "Welcome to $BASENAME $VERSION by Pierre Rioux.\n";
+
+my $REVS   = &GetListOfRevs(); # in reverse order: most recent in [0], oldsest in [-1]
+my $REVIDX = 0;
+if (defined($INITREV)) {
+  my $found = &FindRevIdx($INITREV);
+  $REVIDX=$found if defined($found);
+}
+my $REV     = $REVS->[$REVIDX];
+my $NUMREVS = scalar(@$REVS);
+
+my %PrettyCommands = (
+  x     => "Exit",
+  h     => "Help",
+ '?'    => "Help",
+  i     => "Show GIT info for current commit",
+  l     => "Show GIT log for current commit",
+  d     => "Show GIT diffs for current commit",
+  a     => "Annotate by Authors",
+  r     => "Annotate by Revisions",
+  f     => "Show all GIT logs",
+  p     => "Go to previous commit",
+  n     => "Go to next commit",
+ '['    => "Go 5 commits earlier",
+ ']'    => "Go 5 commits later",
+ '<'    => "Go to earliest commit",
+ '>'    => "Go to latest commit",
+ 'g'    => "Got to commit: ",
+  v     => "Toggle VERBOSE mode for 'l', 'f' and 'i' commands",
+);
+
+my $showprompt = 1;
+
+while (1) {
+
+  # Prompt
+  my $shortrev = substr($REV,0,$REV_PREFIX_LEN);
+  my $idxRev = $NUMREVS - $REVIDX;
+  print "${PROMPT_COL}At commit #$shortrev ($idxRev/$NUMREVS) > ${RESET_COL}\e[J" if $showprompt;
+  $showprompt = 0;
+
+  # Get char
+  system("stty raw -echo");
+  my $c = getc;
+  system("stty -raw echo");
+  $c = 'x' if !defined($c) || $c =~ /[q\cC]/i;
+  $c = lc $c;
+
+  next unless exists $PrettyCommands{$c};
+
+  # Go to rev
+  if ($c eq "g") {
+    print $COMMAND_COL,$PrettyCommands{$c},$RESET_COL;
+    my $gotorev = <STDIN>;
+    $gotorev =~ s/\s+//g;
+    my $found = $gotorev ? &FindRevIdx($gotorev) : $REVIDX;
+    if ( defined $found) {
+      $REVIDX = $found;
+      $REV = $REVS->[$REVIDX];
+      &ShowLog;
+    } else {
+      print "${ERROR_COL}Revision not found.${RESET_COL}\n";
+    }
+    $showprompt=1;
+    next;
+  }
+
+  print $COMMAND_COL,$PrettyCommands{$c},"$RESET_COL\n";
+  last if $c =~ /[qx]/;
+  &ShowHelp                  if $c eq 'h' || $c eq '?';
+  &ShowInfo                  if $c eq 'i';
+  &ShowBlame('a')            if $c eq 'a';
+  &ShowBlame('r')            if $c eq 'r';
+  &ShowLog                   if $c eq 'l';
+  &ShowFull                  if $c eq 'f';
+  &ShowDiff                  if $c eq 'd';
+  &PrevRev(1)                if $c eq 'p';
+  &NextRev(1)                if $c eq 'n';
+  &PrevRev(5)                if $c eq '[';
+  &NextRev(5)                if $c eq ']';
+  &PrevRev(@$REVS-$REVIDX-1) if $c eq '<';  # @$REVS is in reverse order
+  &NextRev($REVIDX)          if $c eq '>';  # @$REVS is in reverse order
+  &TogVerb                   if $c eq 'v';
+
+  $showprompt = 1;
+}
+
+print "Goodbye!\n";
+
+exit 0;
+
+#############################
+#   S U B R O U T I N E S   #
+#############################
+
+sub GetListOfRevs {
+  print "Getting list of commit numbers for target '$TARGET'...\n"      if $TARGET ne ".";
+  print "Getting list of commit numbers for the current directory...\n" if $TARGET eq "."; # let's be pretty
+  #my @info = `git rev-list HEAD -- '$TARGET' 2>&1`;  # old ?
+  # TODO: implement options for using --date-order or --topo-order with "git log",
+  # or even use the git rev-list command above instead to also get merge commits...
+  my @info=`git log --format=%H --follow -- '$TARGET' 2>&1`;
+  chomp @info;
+  die "Error: can't find any commit IDs ?!?\n" unless @info > 0;
+  my $PRETTY_TARGET = "(unknown)";
+  if (-f $TARGET) {
+    $PRETTY_TARGET = `git ls-files --full-name HEAD -- '$TARGET' 2>/dev/null`;
+    chomp $PRETTY_TARGET;
+  } else {
+    my $dirtarget = $TARGET;
+    $dirtarget=getcwd() if $dirtarget eq ".";
+    $PRETTY_TARGET = `git ls-tree --full-name HEAD -- '$dirtarget' | head -1 | cut -f2 2>/dev/null`;
+    if ($PRETTY_TARGET =~ m#/#) {
+      $PRETTY_TARGET =~ s#/[^/]*$##;
+    } else {
+      $PRETTY_TARGET = "(Project Root)"
+    }
+  }
+  die "Error: can't seem to find the file or directory that matches '$TARGET' ?!?\n"
+     unless $PRETTY_TARGET;
+  print "The effective GIT target seems to be: '$PRETTY_TARGET' ...\n";
+  my $revs = [ @info ];
+  print "Found ",scalar(@$revs), " commits: ";
+  if (@$revs < 6) {
+    print join(", ",@{&short_revs_array($revs)}), "\n";
+  } else {
+    print join(", ",@{&short_revs_array([ @$revs[0..2] ] )}),     " ... ",
+          join(", ",@{&short_revs_array([ @$revs[-3,-2,-1] ] )}), "\n";
+  }
+  print "\n";
+  $revs;
+}
+
+# Given an array of commit SHA1 IDs, return
+# an array of the short version of these.
+sub short_revs_array {
+  my $revs = shift;
+  my $len  = shift || $REV_PREFIX_LEN;
+  my $short = [];
+  foreach my $r (@$revs) {
+    my $s = substr($r,0,$len);
+    push(@$short,$s);
+  }
+  $short;
+}
+
+sub ShowHelp {
+  my $r = $RESET_COL;
+  my $c = $COMMAND_COL;
+  my $p = $PROMPT_COL;
+
+  print << "HELP_MESSAGE";
+
+List of available commands:
+
+  Changing the current commit:
+  ---------------------------------------------------------------------
+  ${p}p${r}   - ${c}Go to the next commit${r}
+  ${p}n${r}   - ${c}Go to the previous commit${r}
+  ${p}[${r}   - ${c}Go 5 commits earlier${r}
+  ${p}]${r}   - ${c}Go 5 commits later${r}
+  ${p}<${r}   - ${c}Go to earliest commit${r}
+  ${p}>${r}   - ${c}Go to latest commit${r}
+  ${p}g${r}   - ${c}Enter and go to a specific commit ID${r}
+
+  Displaying information about the current commit:
+  ---------------------------------------------------------------------
+  ${p}a${r}   - ${c}Annotate by Authors${r} (for files only)
+  ${p}r${r}   - ${c}Annotate by Revisions${r} (for files only)
+  ${p}i${r}   - ${c}Displays information about the target for the current commit${r}
+  ${p}l${r}   - ${c}Show the GIT log entry for the current commit${r}
+  ${p}d${r}   - ${c}Show the GIT diffs for the current commit${r}
+
+  Displaying information about all commits:
+  ---------------------------------------------------------------------
+  ${p}f${r}   - ${c}Show the log entries for all commits${r}
+
+  Miscellaneous commands:
+  ---------------------------------------------------------------------
+  ${p}v${r}   - ${c}Toggle verbose mode for 'i', 'l' and 'f' commands.${r}
+  ${p}h${r}   - ${c}Displays this help message${r}
+  ${p}q,x${r} - ${c}Quit the program.${r}
+
+Note that this program is poor at understanding branching; it considers
+the full list of commits as ordered by timestamps only. Most of the time
+that makes little difference, but be careful.
+
+HELP_MESSAGE
+}
+
+sub ShowInfo {
+  my $io = IO::File->new("$GIT_INFO_CMD --follow -1 $GIT_INFO_CMD_OPTS $REV -- '$TARGET'|");
+  my @info = <$io>;
+  $io->close();
+  #if ($VERBOSE eq "") {
+  #  @info = grep(! /^(Path|Name|URL|Repository|Node)|^\s*$/, @info);
+  #}
+  print @info;
+}
+
+sub ShowBlame {
+  if (-d $TARGET) {
+    print "${ERROR_COL}This command only works on specific files.${RESET_COL}\n";
+    return;
+  }
+  my $what = shift || 'r'; # r or a
+  my $com = ($GIT_BLAME_CMD =~ /git-pr_blame/) ? "$GIT_BLAME_CMD -C$what" : "$GIT_BLAME_CMD";
+  &my_system("$com $GIT_BLAME_CMD_OPTS $REV -- '$TARGET' | $PAGER");
+}
+
+sub ShowLog {
+  &my_system("$GIT_LOG_CMD $VERBOSE -1 $GIT_LOG_CMD_OPTS $REV | $PAGER");
+}
+
+sub ShowFull {
+  #if (! -f "$FULL_LOG_CACHE$VERBOSE" || -s _ == 0) {
+  #  open(TMPOUT,">$FULL_LOG_CACHE$VERBOSE");close(TMPOUT); # touch
+  #  #my $cnt = 1;
+  #  #foreach my $rev (@$REVS) {
+  #  #  print " ... $cnt/",scalar(@$REVS),"\r"; $cnt++;
+  #  #  &my_system("$GIT_LOG_CMD $VERBOSE -1 $GIT_LOG_CMD_OPTS $rev >> '$FULL_LOG_CACHE$VERBOSE' 2>/dev/null");
+  #  #}
+  #  &my_system("$GIT_LOG_CMD $VERBOSE $GIT_LOG_CMD_OPTS " . $REVS->[0] . " -- '$TARGET' >> '$FULL_LOG_CACHE$VERBOSE' 2>/dev/null");
+  #}
+  #&my_system("cat '$FULL_LOG_CACHE$VERBOSE' | $PAGER");
+  &my_system("$GIT_LOG_CMD $VERBOSE $GIT_LOG_CMD_OPTS " . $REVS->[0] . " -- '$TARGET' | $PAGER");
+}
+
+sub TogVerb {
+  if ($VERBOSE eq "") {
+    $VERBOSE="-v";
+    print "Log and info commands ('v', 'f' and 'i') are now VERBOSE.\n";
+  } else {
+    $VERBOSE="";
+    print "Log and info commands ('v', 'f' and 'i') now show normal output.\n";
+  }
+}
+
+sub ShowDiff {
+  if ($REVIDX >= @$REVS - 1) {
+    my $short = &short_revs_array( [ $REV ] )->[0];
+    print "Cannot show DIFF: commit $short is already the earliest one.\n";
+    return;
+  }
+  my $prev = $REVS->[$REVIDX+1];
+  &my_system("$GIT_DIFF_CMD -r$prev:$REV $GIT_DIFF_CMD_OPTS '$TARGET' | $PAGER");
+}
+
+sub PrevRev {
+  my $jump = shift || 1;
+  my $max = @$REVS - 1 - $REVIDX;
+  $jump = $max if $jump > $max;
+  if ($jump <= 0) {
+    my $short = &short_revs_array( [ $REV ] )->[0];
+    print "Cannot go to previous commit, as $short is already the earliest one.\n";
+    return;
+  }
+  $REVIDX += $jump;
+  $REV = $REVS->[$REVIDX];
+  &ShowLog;
+}
+
+sub NextRev {
+  my $jump = shift || 1;
+  my $max  = $REVIDX;
+  $jump = $max if $jump > $max;
+  if ($jump <= 0) {
+    my $short = &short_revs_array( [ $REV ] )->[0];
+    print "Cannot go to next commit, as $short is already the latest one.\n";
+    return;
+  }
+  $REVIDX -= $jump;
+  $REV = $REVS->[$REVIDX];
+  &ShowLog;
+}
+
+sub FindRevIdx {
+  my $prefix = shift;
+  my $found  = undef;
+  for (my $i=0;$i<@$REVS;$i++) {
+    if (substr($REVS->[$i],0,length($prefix)) eq $prefix) {
+      $found=$i;
+      last;
+    }
+  }
+  $found;
+}
+
+sub my_system {
+  my @stuff = @_;
+  if ($DEBUG > 0) {
+    print "\e[36;1mSYSTEM: ",join(" ",@stuff),"\e[0m\n";
+  }
+  system(@stuff);
+}
+
+END {
+  system("stty -raw echo;stty sane");
+  unlink $FULL_LOG_CACHE;
+  unlink "$FULL_LOG_CACHE-v";
+}

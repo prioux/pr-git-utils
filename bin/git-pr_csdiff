@@ -1,0 +1,145 @@
+#!/usr/bin/perl -w
+
+##############################################################################
+#
+#                             git-sdiff and git-csdiff
+#
+# DESCRIPTION:
+# Wrapper that applies sdiff or csdiff to GIT revisions of a file.
+# Based on cvs-sdiff, cvs-csdiff, svn-sdiff and svn-csdiff; handling of the
+# revision information is done using the git syntax.
+#
+##############################################################################
+
+##########################
+# Initialization section #
+##########################
+
+require 5.00;
+use strict;
+use IO::File;
+
+# Default umask
+umask 027;
+
+# Program's name and version number.
+my ($BASENAME) = ($0 =~ /([^\/]+)$/);
+our $VERSION   = "2.0";
+
+# Get login name.
+my $USER=getpwuid($<) || getlogin || die "Can't find USER from environment!\n";
+
+#########
+# Usage #
+#########
+
+sub Usage { # private
+    print <<USAGE;
+
+$BASENAME $VERSION by Pierre Rioux
+
+Usage: $BASENAME [-rC1 [-rC2]| -rC1:C2] [csdiff options] [sdiff options] path
+
+Common invocations:
+
+  $BASENAME -C5 -W path               # -C5 is a csdiff option, -W is a sdiff option
+  $BASENAME -r023afa -rd00d23 -W path # -rXYZ are git commit IDs, -W is a sdiff option
+  $BASENAME -r023afa:d00d23   -W path # same as prev example
+
+When no commit ID is supplied, the diffs between HEAD and the working tree are shown.
+When one commit ID is supplied, the diffs between it and the working tree are shown.
+Note that 'path' can be a file or a directory.
+
+See the man page for the 'csdiff' utility for its options.
+
+USAGE
+    exit 1;
+}
+
+##################################
+# Global variables and constants #
+##################################
+
+my $DEBUG=0;
+my @REVLIST=(); # 0, 1 or 2 elements
+
+##############################
+# Parse command-line options #
+##############################
+
+for (;@ARGV;) {
+    # Add in the regex [] ALL single-character command-line options
+    my ($opt,$arg) = ($ARGV[0] =~ /^-([\@hr])(.*)$/);
+    last if ! defined $opt;
+    # Add in regex [] ONLY single-character options that
+    # REQUIRE an argument, except for the '@' debug switch.
+    if ($opt =~ /[r]/ && $arg eq "") {
+        if (@ARGV < 2) {
+            print "Argument required for option \"$opt\".\n";
+            exit 1;
+        }
+        shift;
+        $arg=$ARGV[0];
+    }
+    $DEBUG=($arg ? $arg : 1)                     if $opt eq '@';
+    push(@REVLIST,split(/:/,$arg))               if $opt eq 'r';
+    &Usage                                       if $opt eq 'h';
+    shift;
+}
+
+#################################
+# Validate command-line options #
+#################################
+
+&Usage if @ARGV == 0 || $ARGV[-1] =~ /^-/;
+&Usage if @REVLIST > 2;
+my $FILE=pop(@ARGV);
+
+################
+# Trap Signals #
+################
+
+sub SigCleanup { # private
+     die "\nExiting: received signal \"" . $_[0] . "\".\n";
+}
+$SIG{'INT'}  = \&SigCleanup;
+$SIG{'TERM'} = \&SigCleanup;
+$SIG{'HUP'}  = \&SigCleanup;
+$SIG{'QUIT'} = \&SigCleanup;
+#$SIG{'PIPE'} = \&SigCleanup;
+$SIG{'ALRM'} = \&SigCleanup;
+
+###############################
+#   M A I N   P R O G R A M   #
+###############################
+
+my $PROG = "sdiff";
+$PROG="csdiff" if $BASENAME =~ /csdiff/;
+my $other_options = join(" ",@ARGV);
+#$other_options ||= "-L A";
+
+push(@REVLIST,"HEAD") if @REVLIST == 0;
+
+my @names = `git diff --name-only @REVLIST -- $FILE 2>/dev/null`;
+chomp @names;
+exit 0 if @names == 0;
+
+while (! -d ".git") {
+  chdir("..");
+  my $pwd = `pwd`;
+  chomp $pwd;
+  die "Can't find .git directory?!?" if $pwd eq "/";
+}
+
+foreach my $name (@names) {
+  print "\e[33;1mFile: $name\e[0m\n";
+  print "\e[33;1m","=" x (length($name) + 6),"\e[0m\n";
+  system("git", "difftool", "--no-prompt", "--extcmd=$PROG $other_options", @REVLIST, "--", $name);
+}
+
+exit 0;
+
+#############################
+#   S U B R O U T I N E S   #
+#############################
+

@@ -1,0 +1,316 @@
+#!/usr/bin/perl -w
+
+##############################################################################
+#
+#                                 git-blame.pl
+#
+# DESCRIPTION:
+# Wrapper that provides color-coding for 'git annotate' output.
+#
+##############################################################################
+
+##########################
+# Initialization section #
+##########################
+
+require 5.00;
+use strict;
+use IO::File;
+use Term::ANSIColor qw( :constants );
+
+# Default umask
+umask 027;
+
+# Program's name and version number.
+my ($BASENAME) = ($0 =~ /([^\/]+)$/);
+my $VERSION    = "2.0";
+
+# Get login name.
+my $USER=getpwuid($<) || getlogin || die "Can't find USER from environment!\n";
+
+#########
+# Usage #
+#########
+
+sub Usage { # private
+    print <<USAGE;
+
+$BASENAME $VERSION by Pierre Rioux
+
+Usage: $BASENAME [-Ca | -Cr] [-S 'commit,author,date,time'] [git annotate options] file
+
+where: -Ca        : colors by author name
+       -Cr        : colors by commit date
+       -S columns : what to show on each line; join keywords (shown above) together.
+
+The default columns for -S are "commit,author" when coloring by author,
+and "commit,author,date" when coloring by commit date.
+
+Examples:
+
+    $BASENAME -Ca -S author myfile.txt   # show lines prefixed only by author, colored by author
+    $BASENAME -Cr -S date   myfile.txt   # show lines prefixed only by date, colored by date
+    $BASENAME -Ca -S commit,author,date myfile.txt
+    $BASENAME -Cr -S commit,author,date,time myfile.txt
+
+USAGE
+    exit 1;
+}
+
+##################################
+# Global variables and constants #
+##################################
+
+my $DEBUG     = 0;
+my $PREF_FILE = $ENV{'HOME'} . "/.pr_tools_prefs.pl";
+
+# Customize output here; these color combinations
+# will be used in turn, in order, and assigned to authors
+# as they are encountered in the log. Make sure this list
+# has at least one color unless you like dividing by zero.
+our @COLORS_LIST = (
+   BOLD . YELLOW,
+   BOLD . MAGENTA,
+   BOLD . CYAN,
+   BOLD . WHITE . ON_BLUE,
+   BOLD . GREEN,
+   BOLD . WHITE . ON_GREEN,
+   BLUE,
+   RED,
+);
+
+# Internal DB of authors found, and colors assigned to them.
+# These can be set permanently by editing the external file 
+# $PREF_FILE (defined above), which is created at first invocation.
+#
+# These colors are used when option -Ca is specified.
+our %COLORS_AUTHORS = ();
+
+# This is a 'rainbow' list of colors in increasing order of 'hotness';
+# the last entries will be assigned to the most recent commits,
+# the earliest entries to the oldest commits.
+#
+# These colors are used when option -Cr is specified.
+our @COLORS_REVS = (
+   BLUE,                        # old commits
+   BOLD . BLUE,
+   BOLD . GREEN,
+   BOLD . YELLOW,
+   BOLD . RED,
+   BOLD . WHITE . ON_RED,       # latest commits
+);
+
+&LoadPrToolPrefs($PREF_FILE);
+
+my $OFF = RESET;
+
+# Options
+my $MODE="AUTHOR";  # -Ca vs -Cr
+my $SHOWWHAT="";    # -S option
+
+##############################
+# Parse command-line options #
+##############################
+
+for (;@ARGV;) {
+    # Add in the regex [] ALL single-character command-line options
+    my ($opt,$arg) = ($ARGV[0] =~ /^-([\@ChS])(.*)$/);
+    last if ! defined $opt;
+    # Add in regex [] ONLY single-character options that
+    # REQUIRE an argument, except for the '@' debug switch.
+    if ($opt =~ /[CS]/ && $arg eq "") {
+        if (@ARGV < 2) {
+            print "Argument required for option \"$opt\".\n";
+            exit 1;
+        }
+        shift;
+        $arg=$ARGV[0];
+    }
+    $DEBUG=($arg ? $arg : 1)                     if $opt eq '@';
+    $MODE="AUTHOR"                               if $opt eq 'C' && $arg eq 'a';
+    $MODE="REVISION"                             if $opt eq 'C' && $arg eq 'r';
+    $SHOWWHAT=$arg                               if $opt eq 'S';
+    &Usage                                       if $opt eq 'h';
+    shift;
+}
+
+#################################
+# Validate command-line options #
+#################################
+
+&Usage if @ARGV < 1 || $ARGV[0] =~ /^--?h(elp)/;
+my @GITARGS = @ARGV;
+
+if ($SHOWWHAT eq "") {
+   $SHOWWHAT = $MODE eq "AUTHOR" ? "commit,author" : "commit,author,date"
+}
+
+################
+# Trap Signals #
+################
+
+sub SigCleanup { # private
+     die "\nExiting: received signal \"" . $_[0] . "\".\n";
+}
+$SIG{'INT'}  = \&SigCleanup;
+$SIG{'TERM'} = \&SigCleanup;
+$SIG{'HUP'}  = \&SigCleanup;
+$SIG{'QUIT'} = \&SigCleanup;
+#$SIG{'PIPE'} = \&SigCleanup;
+$SIG{'ALRM'} = \&SigCleanup;
+
+###############################
+#   M A I N   P R O G R A M   #
+###############################
+
+# Get number of columns
+my @stty = `stty -a | head -1`;
+my ($cols) = $stty[0] =~ m#col(?:umns?)\s+(\d+)#;
+   ($cols) = $stty[0] =~ m#(\d+)\s+col# if !defined $cols;
+die "Cannot find number of columns in terminal?!? Got: '$cols'.\n"
+     unless $cols =~ m#^\d+$#;
+
+# Run blame
+my @out = `git annotate @GITARGS`;
+
+my $datesidx = {};
+if ($MODE eq "REVISION") {
+   $datesidx = &OrderAllDates(\@out) if $MODE eq "REVISION";
+}
+my $range     = scalar(keys %$datesidx); # how many distinct dates found
+my $numcolors = scalar(@COLORS_REVS);    # how many distinct colors found in rainbow (not always 7)
+
+# Dump colored lines
+#02488533        (    prioux     2010-02-03 18:02:12 +0000       12)
+#12a5c9e6        (   tsherif     2009-10-09 20:33:49 +0000       13)class Message < ActiveRecord::Base
+my $rotating_counter = 0;
+foreach my $line (@out) {
+    $line =~ s/\s*$//;
+    $line =~ s/\t/ /g; #detab
+    my ($author,$date) = ($line =~ /\(\s*(\S.*\S)\s+(\d\d\d\d-\d\d-\d\d\s\d\d:\d\d:\d\d)/);
+
+    # Reformat the content a little
+    if ($line =~ /^(\S+)\s*\(\s*(\S.*\S)\s+(\d\d\d\d-\d\d-\d\d)\s(\d\d:\d\d:\d\d)\s*(\S*)\s*\d+\)/) {
+       my ($com,$user,$date,$time) = ($1,$2,$3,$4);
+       my $preflen = length($&);
+       $line = substr($line,$preflen);
+       my $pref = "";
+       $user = $1 if $user =~ /^(\S+)\s+/; # first keyword of user
+       $pref .= sprintf("%-8.8s ", $com)  if $SHOWWHAT =~ /rev|com/i;
+       $pref .= sprintf("%-8.8s ", $user) if $SHOWWHAT =~ /aut|use/i;
+       $pref .= "$date "                  if $SHOWWHAT =~ /dat/i;
+       $pref .= "$time "                  if $SHOWWHAT =~ /tim/i;
+       $line = $pref . $line;
+    }
+
+    # Coloring by author
+    my $color = "";
+    if ($MODE eq "AUTHOR") {
+        $color = $COLORS_AUTHORS{$author};
+        if (!$color) {
+            $color = $COLORS_LIST[$rotating_counter];
+            $rotating_counter = ($rotating_counter + 1) % scalar(@COLORS_LIST);
+            $COLORS_AUTHORS{$author} = $color;
+            #print STDERR "Chosen color: $color$author$OFF\n";
+        }
+        #$color = $COLORS_AUTHORS{"default"} if !defined($color);
+    } else { # Coloring by revision
+        my $rankdate = $datesidx->{$date} || 0;
+        my $rank     = $rankdate / $range;
+        my $idx      = int($rank * $numcolors * $numcolors / ($numcolors+1));
+        $color = $COLORS_REVS[$idx];
+    }
+    $line .= (" " x ($cols - length($line)));
+    if ($color eq "") {
+        print $line,"\n";
+    } else {
+        print $color,$line,$OFF,"\n";
+    }
+}
+
+exit 0;
+
+#############################
+#   S U B R O U T I N E S   #
+#############################
+
+#02488533        (    prioux     2010-02-03 18:02:12 +0000       12)
+#12a5c9e6        (   tsherif     2009-10-09 20:33:49 +0000       13)class Message < ActiveRecord::Base
+
+# Parse the output of git annotate, extract all dates and times
+# and return a hash of a unique list of each date associated with an ranking 0..n
+# (where 0 is the oldest date, n is the most recent)
+sub OrderAllDates {
+    my $txt = shift;
+    my @dates    = ();
+    my %seen     = ();
+    foreach my $line (@$txt) {
+       next unless $line =~ /(\d\d\d\d-\d\d-\d\d\s\d\d:\d\d:\d\d)/;
+       my $date = $1;
+       next if $seen{$date}++;
+       push(@dates,$date);
+    }
+    @dates = sort @dates;
+    my $datesidx = {};
+    for (my $i=0;$i<@dates;$i++) {
+      my $date = $dates[$i];
+      $datesidx->{$date}=$i;
+    }
+    $datesidx;
+}
+
+sub LoadPrToolPrefs {
+  my $pref_file = shift;
+
+  if (! -f $pref_file) {
+    open(PF,">$pref_file");
+    print PF <<PREF_TEMPLATE;
+#
+# Preferences for git-pr_* tools
+# Careful when editing this file, it is in Perl syntax.
+#
+
+# Remove these three lines once you're done customizing this file.
+print "Please customize the file\\n" .
+      "  $pref_file\\n" .
+      "to select your favorite colors.\\n"; exit 0;
+
+#
+# Color customization for git-pr_blame, git-pr_log and git-pr_hist
+#
+# Available color keywords are:
+#
+# * Foreground colors:
+#
+#      RED    GREEN    BLUE    YELLOW    MAGENTA    CYAN    WHITE
+#
+# * Background colors:
+#
+#   ON_RED ON_GREEN ON_BLUE ON_YELLOW ON_MAGENTA ON_CYAN ON_WHITE
+#
+# * Modifiers:
+#
+#   BOLD BLINK UNDERLINE
+#
+
+our \%COLORS_AUTHORS = (
+   'prioux'                   => BOLD . YELLOW,
+   'Pierre Rioux'             => BOLD . YELLOW,
+   'elizabeth'                => BOLD . MAGENTA,
+   'mary'                     => BOLD . CYAN,
+   'lydia'                    => BOLD . WHITE . ON_BLUE,
+   'kitty'                    => BOLD . GREEN,
+   'darcy'                    => BOLD . WHITE . ON_GREEN,
+   'bingley'                  => BLUE,
+   'collins'                  => RED,
+   'wickham'                  => BOLD . WHITE . ON_RED,
+);
+
+1; # Leave this alone
+PREF_TEMPLATE
+    close(PF);
+  }
+
+  require $pref_file;
+}
+

@@ -1,0 +1,336 @@
+#!/usr/bin/perl -w
+
+##############################################################################
+#
+#                                 git-log.pl
+#
+# DESCRIPTION:
+# Wrapper that provides color-coding for 'git whatchanged' output.
+#
+##############################################################################
+
+##########################
+# Initialization section #
+##########################
+
+require 5.00;
+use strict;
+use IO::File;
+use Term::ANSIColor qw( :constants );
+
+# Default umask
+umask 027;
+
+# Program's name and version number.
+my ($BASENAME) = ($0 =~ /([^\/]+)$/);
+my $VERSION    = "2.0";
+
+# Get login name.
+my $USER=getpwuid($<) || getlogin || die "Can't find USER from environment!\n";
+my $HOME=$ENV{'HOME'};
+
+#########
+# Usage #
+#########
+
+sub Usage { # private
+    print <<USAGE;
+
+$BASENAME $VERSION by Pierre Rioux
+
+Usage: $BASENAME [-N preflen] [-P (none|author|line|prefix)] [-v] [git whatchanged options] file
+
+where:
+      -N preflen     : shows the first preflen characters of the commit IDs
+
+      -P mode        : selects the coloring mode for changed files.
+                       mode is one of none, author, line or prefix:
+
+         -P none   : do not show changed files at all (default)
+         -P author : all changed files have the color of the author of the commit
+         -P line   : color affects the full line of the changed file
+         -P prefix : color affects only the character spec of the file
+
+      -v             : is a synonym of '-P prefix', it's the nicest one.
+
+The argument 'file' can be either a file or a directory of the git repo,
+and only the changes associated with that file or directory will be shown
+in the logs.
+
+USAGE
+    exit 1;
+}
+
+##################################
+# Global variables and constants #
+##################################
+
+my $DEBUG=0;
+my $PREF_FILE = $ENV{'HOME'} . "/.pr_tools_prefs.pl";
+my $COMMIT_PREFIX_LEN = 6;
+
+# Customize output here; these color combinations
+# will be used in turn, in order, and assigned to authors
+# as they are encountered in the log. Make sure this list
+# has at least one color unless you like dividing by zero.
+our @COLORS_LIST = (
+   BOLD . YELLOW,
+   BOLD . MAGENTA,
+   BOLD . CYAN,
+   BOLD . WHITE . ON_BLUE,
+   BOLD . GREEN,
+   BOLD . WHITE . ON_GREEN,
+   BLUE,
+   RED,
+);
+my $ROTATING_COUNTER=0; # use for scanning list above.
+
+# Internal DB of authors found, and colors assigned to them.
+# These can be set permanently by editing the external file 
+# $PREF_FILE (defined above) which is created at first invocation.
+#
+# These colors are used when option -Ca is specified.
+our %COLORS_AUTHORS = ();
+
+our %COLORS_CHANGED_PATHS = (
+   M          => BOLD . BLUE,
+   A          => BOLD . GREEN,
+   D          => BOLD . RED,
+   R          => BOLD . WHITE . ON_RED,
+  '?'         => BOLD . WHITE . ON_RED,
+);
+
+&LoadPrToolPrefs($PREF_FILE);
+
+my $OFF       = RESET;
+
+my $OPTION_COLOR_PATHS="";
+
+##############################
+# Parse command-line options #
+##############################
+
+for (;@ARGV;) {
+    # Add in the regex [] ALL single-character command-line options
+    my ($opt,$arg) = ($ARGV[0] =~ /^-([\@NhPv])(.*)$/);
+    last if ! defined $opt;
+    # Add in regex [] ONLY single-character options that
+    # REQUIRE an argument, except for the '@' debug switch.
+    if ($opt =~ /[NP]/ && $arg eq "") {
+        if (@ARGV < 2) {
+            print "Argument required for option \"$opt\".\n";
+            exit 1;
+        }
+        shift;
+        $arg=$ARGV[0];
+    }
+    $DEBUG=($arg ? $arg : 1)                     if $opt eq '@';
+    $OPTION_COLOR_PATHS=$arg                     if $opt eq 'P';
+    $OPTION_COLOR_PATHS ||= "prefix"             if $opt eq 'v';
+    $COMMIT_PREFIX_LEN=$arg                      if $opt eq 'N';
+    &Usage                                       if $opt eq 'h';
+    shift;
+}
+
+#################################
+# Validate command-line options #
+#################################
+
+&Usage if @ARGV && $ARGV[0] =~ /^--?h(elp)/;
+@ARGV = ( "." ) if @ARGV < 1;
+my @GITARGS = @ARGV;
+
+$OPTION_COLOR_PATHS ||= "none";
+if ($OPTION_COLOR_PATHS !~ /^(author|line|prefix|none)$/i) {
+  die "Unknown keyword for -P option. Should be one of none, author, line, or prefix.\n";
+}
+
+################
+# Trap Signals #
+################
+
+sub SigCleanup { # private
+     die "\nExiting: received signal \"" . $_[0] . "\".\n";
+}
+$SIG{'INT'}  = \&SigCleanup;
+$SIG{'TERM'} = \&SigCleanup;
+$SIG{'HUP'}  = \&SigCleanup;
+$SIG{'QUIT'} = \&SigCleanup;
+#$SIG{'PIPE'} = \&SigCleanup;
+$SIG{'ALRM'} = \&SigCleanup;
+
+###############################
+#   M A I N   P R O G R A M   #
+###############################
+
+# Get number of columns
+my @stty = `stty -a | head -1`;
+my ($cols) = $stty[0] =~ m#col(?:umns?)\s+(\d+)#;
+   ($cols) = $stty[0] =~ m#(\d+)\s+col# if !defined $cols;
+die "Cannot find number of columns in terminal?!? Got: '$cols'.\n"
+     unless $cols =~ m#^\d+$#;
+
+# Run log
+my @out = `git whatchanged -m @GITARGS`;
+chomp @out;
+foreach my $l (@out) {
+  $l =~ s/\t/ /g;
+}
+
+# Dump colored lines
+while (@out) {
+
+    # Extract paragraph for one revision
+    my @para = ();
+    shift(@out) while @out > 0 && $out[0] !~ /^commit [0-9a-fA-F]{40}/;
+    last unless @out > 0;
+    @para = shift(@out);
+    push(@para,shift(@out)) while @out && $out[0] !~ /^commit [0-9a-fA-F]{40}/;
+
+    # Tidy up blank lines
+    pop(@para)        while @para > 0 && $para[-1] =~ /^\s*$/; # remove trailing blank lines
+
+    # Pop file info
+    my @fileinfo = ();
+    while (@para > 0 && $para[-1] =~ /^:/) {
+      my $fi = pop(@para);
+      #:000000 100644 0000000... d6b0ce9... A  BrainPortal/app/models/cbrain_task/serializer.rb
+      $fi =~ s/^:\d+\s+\d+\s+\S+\s+\S+\s*/   /; # three spaces
+      unshift(@fileinfo,$fi);
+    }
+    pop(@para)        while @para > 0 && $para[-1] =~ /^\s*$|^\s+git-svn-id:/; # remove trailing blank lines or svn-id lines
+
+    last if @para <= 1;
+
+    &color_paragraph(\@para,\@fileinfo);
+    print @para;
+
+}
+
+exit 0;
+
+#############################
+#   S U B R O U T I N E S   #
+#############################
+
+sub color_paragraph {
+    my $para     = shift;
+    my $fileinfo = shift;
+
+    #commit aad9851a00170e864df4da314f20fd740751df00
+    #Merge: xyz xyz
+    #Author: prioux <prioux@bcc1f7e1-216c-4ce3-888e-c5a8bb225047>
+    #Date:   Thu Mar 24 18:15:28 2011 +0000
+
+    my ($commit)        = ( shift(@$para) =~ /commit\s+(\S+)/i );
+    shift(@$para) if $para->[0] =~ /^merge/i;
+    my ($author)        = ( shift(@$para) =~ /Author:\s+(\S.*?\S)\s+</i );
+    my ($date,$time,$y) = ( shift(@$para) =~ /Date:\s+(\S.*?\S)\s*(\d\d:\d\d:\d\d)\s+(\d\d\d\d)/i );
+    my $ydate = "$date $y";
+
+    # r362 | prioux | 2009-07-28 16:10:54 -0400 (Tue, 28 Jul 2009) | 2 lines
+    #my ($rev,$author,$date,$time,$tz,$pdate,$rest) = ($header =~ /^\s*(\S+)\s+\|\s+(\S+)\s+\|\s+(\S+)\s+(\S+)\s+(\S+)\s+\(([\w\,\s]+)\)\s+\|(.*)/);
+    #$para->[1] = "   $rev   |   $author   |   $pdate $time";
+    unshift(@$para, sprintf("%" . "${COMMIT_PREFIX_LEN}.${COMMIT_PREFIX_LEN}s | %s | %s %s", $commit, $author, $ydate, $time));
+    unshift(@$para, ("-" x length($para->[0])));
+    push(@$para,"");
+
+    # Coloring of header info
+    my $auth_color = $COLORS_AUTHORS{$author};
+    if (!$auth_color) {
+        $auth_color = $COLORS_LIST[$ROTATING_COUNTER];  # ugly global counter!!!
+        $ROTATING_COUNTER = ($ROTATING_COUNTER + 1) % scalar(@COLORS_LIST);
+        $COLORS_AUTHORS{$author} = $auth_color;
+        #print STDERR "Chosen color: $auth_color$author$OFF\n";
+    }
+
+    for (my $n=0;$n<@$para; $n++) {
+       my $line  = $para->[$n];
+       $line .= (" " x ($cols - length($line)));
+       $para->[$n] = "$auth_color$line$OFF\n";
+    }
+
+    return if $OPTION_COLOR_PATHS =~ /none/i;
+
+    # File info coloring
+    for (my $n=0;$n<@$fileinfo; $n++) {
+       my $line  = $fileinfo->[$n];
+       my $color = $OPTION_COLOR_PATHS =~ /author/i ? $auth_color : &changed_paths_colors($line);
+       if ($color eq "") {
+         $fileinfo->[$n] = "$line\n";
+         next;
+       }
+       $line .= (" " x ($cols - length($line)));
+       if ($OPTION_COLOR_PATHS =~ /prefix/i)  {
+          $fileinfo->[$n] = $color . substr($fileinfo->[$n],0,5) . $OFF . $auth_color . substr($fileinfo->[$n],5) . "$OFF\n";
+       } else {
+          $fileinfo->[$n] = "$color$line$OFF\n";
+       }
+    }
+    push(@$fileinfo,"\n");
+
+    push(@$para, @$fileinfo);
+    1;
+}
+
+sub changed_paths_colors {
+   my $line = shift;
+   my $char = length($line) > 3 ? substr($line,3,1) : "?";
+   my $cp_color = $COLORS_CHANGED_PATHS{$char} || $COLORS_CHANGED_PATHS{'?'};
+   $cp_color;
+}
+
+sub LoadPrToolPrefs {
+  my $pref_file = shift;
+
+  if (! -f $pref_file) {
+    open(PF,">$pref_file");
+    print PF <<PREF_TEMPLATE;
+#
+# Preferences for git-pr_* tools
+# Careful when editing this file, it is in Perl syntax.
+#
+
+# Remove these three lines once you're done customizing this file.
+print "Please customize the file\\n" .
+      "  $pref_file\\n" .
+      "to select your favorite colors.\\n"; exit 0;
+
+#
+# Color customization for git-pr_blame, git-pr_log and git-pr_hist
+#
+# Available color keywords are:
+#
+# * Foreground colors:
+#
+#      RED    GREEN    BLUE    YELLOW    MAGENTA    CYAN    WHITE
+#
+# * Background colors:
+#
+#   ON_RED ON_GREEN ON_BLUE ON_YELLOW ON_MAGENTA ON_CYAN ON_WHITE
+#
+# * Modifiers:
+#
+#   BOLD BLINK UNDERLINE
+#
+
+our \%COLORS_AUTHORS = (
+   'prioux'                   => BOLD . YELLOW,
+   'Pierre Rioux'             => BOLD . YELLOW,
+   'elizabeth'                => BOLD . MAGENTA,
+   'mary'                     => BOLD . CYAN,
+   'lydia'                    => BOLD . WHITE . ON_BLUE,
+   'kitty'                    => BOLD . GREEN,
+   'darcy'                    => BOLD . WHITE . ON_GREEN,
+   'bingley'                  => BLUE,
+   'collins'                  => RED,
+   'wickham'                  => BOLD . WHITE . ON_RED,
+);
+
+1; # Leave this alone
+PREF_TEMPLATE
+    close(PF);
+  }
+
+  require $pref_file;
+}
