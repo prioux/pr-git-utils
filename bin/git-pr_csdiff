@@ -91,7 +91,10 @@ for (;@ARGV;) {
 # Validate command-line options #
 #################################
 
-&Usage if @ARGV == 0 || $ARGV[-1] =~ /^-/;
+# Some sensible defaults
+unshift(@ARGV, "-C5") unless grep(/^-C/, @ARGV);
+push(@ARGV, ".") if @ARGV == 0 || $ARGV[-1] =~ /^-/;
+
 &Usage if @REVLIST > 2;
 my $FILE=pop(@ARGV);
 
