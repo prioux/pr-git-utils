@@ -46,6 +46,10 @@ Common invocations:
   $BASENAME -r023afa -rd00d23 -W path # -rXYZ are git commit IDs, -W is a sdiff option
   $BASENAME -r023afa:d00d23   -W path # same as prev example
 
+With no arguments or options, the default behavior is to act as
+
+  $BASENAME -C5 .
+
 When no commit ID is supplied, the diffs between HEAD and the working tree are shown.
 When one commit ID is supplied, the diffs between it and the working tree are shown.
 Note that 'path' can be a file or a directory.
@@ -91,9 +95,10 @@ for (;@ARGV;) {
 # Validate command-line options #
 #################################
 
-&Usage if @ARGV == 0 || $ARGV[-1] =~ /^-/;
+@ARGV=("-C5", ".") if @ARGV == 0;
+&Usage if $ARGV[-1] =~ /^-/; # it seems the last arg is an option...? We need at least one path.
 &Usage if @REVLIST > 2;
-my $FILE=pop(@ARGV);
+my $FILE=pop(@ARGV); # last arg is supposed to be target
 
 ################
 # Trap Signals #
