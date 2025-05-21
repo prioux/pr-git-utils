@@ -386,7 +386,7 @@ sub ShowDiff {
     return;
   }
   my $prev = $REVS->[$REVIDX+1];
-  &my_system("$GIT_DIFF_CMD -r$prev:$REV $GIT_DIFF_CMD_OPTS '$TARGET' | $PAGER");
+  &my_system("$GIT_DIFF_CMD -r$REV^:$REV $GIT_DIFF_CMD_OPTS '$TARGET' | $PAGER");
 }
 
 sub PrevRev {
